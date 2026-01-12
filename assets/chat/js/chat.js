@@ -3,6 +3,8 @@ import $ from 'jquery';
 import { debounce } from 'throttle-debounce';
 import moment from 'moment';
 import tippy, { roundArrow } from 'tippy.js';
+import * as linkify from 'linkifyjs';
+import yargsParser from 'yargs-parser/browser';
 import {
   KEYCODES,
   DATE_FORMATS,
@@ -45,20 +47,20 @@ import { isMuteActive, MutedTimer } from './mutedtimer';
 import EmoteService from './emotes';
 import UserFeatures from './features';
 import UserRoles from './roles';
+import { UserMessageService, YouTubeOEmbedService } from './services';
 import makeSafeForRegex, {
-  regexslashcmd,
   regextime,
   nickmessageregex,
   nickregex,
   nsfwregex,
   nsflregex,
-  linkregex,
+  youtubeidregex,
 } from './regex';
-
 import { HashLinkConverter, MISSING_ARG_ERROR } from './hashlinkconverter';
-import ChatCommands from './commands';
+import ChatCommands, { getSlashCommand, removeSlashCommand } from './commands';
 import MessageTemplateHTML from '../../views/templates.html';
 import EventBarEvent from './event-bar/EventBarEvent';
+import Mentions from './mentions';
 
 class Chat {
   constructor(config) {
@@ -91,6 +93,8 @@ class Chat {
     this.flairs = [];
     this.flairsMap = new Map();
     this.emoteService = new EmoteService();
+    this.userMessageService = new UserMessageService();
+    this.youtubeOEmbedService = new YouTubeOEmbedService();
 
     this.user = new ChatUser();
     this.users = new Map();
@@ -99,6 +103,7 @@ class Chat {
     this.settings = new Map(settingsdefault);
     this.commands = new ChatCommands();
     this.autocomplete = new ChatAutoComplete();
+    this.mentions = new Mentions();
     this.menus = new Map();
     this.taggednicks = new Map();
     this.taggednotes = new Map();
@@ -146,6 +151,7 @@ class Chat {
     this.source.on('POLLSTART', (data) => this.onPOLLSTART(data));
     this.source.on('POLLSTOP', (data) => this.onPOLLSTOP(data));
     this.source.on('VOTECAST', (data) => this.onVOTECAST(data));
+    this.source.on('VOTECOUNTED', (data) => this.onVOTECOUNTED(data));
     this.source.on('SUBSCRIPTION', (data) => this.onSUBSCRIPTION(data));
     this.source.on('GIFTSUB', (data) => this.onGIFTSUB(data));
     this.source.on('MASSGIFT', (data) => this.onMASSGIFT(data));
@@ -217,7 +223,7 @@ class Chat {
     this.control.on('MOTD', (data) => this.cmdPIN(data));
     this.control.on('UNPIN', () => this.cmdUNPIN());
     this.control.on('UNMOTD', () => this.cmdUNPIN());
-    this.control.on('HOST', (data) => this.cmdHOST(data));
+    this.control.on('HOST', (data, args) => this.cmdHOST(data, args));
     this.control.on('UNHOST', () => this.cmdUNHOST());
     this.control.on('ADDPHRASE', (data) => this.cmdADDPHRASE(data));
     this.control.on('ADDBAN', (data) => this.cmdADDPHRASE(data));
@@ -236,7 +242,7 @@ class Chat {
     this.control.on('BITLY', () => this.cmdDIE());
   }
 
-  get shouldFocus() {
+  get isDesktop() {
     // return true when not in a mobile context
     return !/\bMobi/.test(window.navigator.userAgent);
   }
@@ -258,23 +264,23 @@ class Chat {
     return this;
   }
 
-  setSettings(settings) {
-    // If authed and #settings.profilesettings=true use #settings
-    // Else use whats in LocalStorage#chat.settings
-    const stored =
-      settings !== null && this.authenticated && settings.get('profilesettings')
-        ? settings
-        : new Map(ChatStore.read('chat.settings') || []);
+  loadCachedSettings() {
+    const settings = new Map(ChatStore.read('chat.settings') || []);
+    this.setSettings(settings);
+  }
 
-    // Loop through settings and apply any settings found in the #stored data
-    if (stored.size > 0) {
+  setSettings(settings) {
+    // Loop through settings and apply them
+    if (settings.size > 0) {
       [...this.settings.keys()]
-        .filter((k) => stored.get(k) !== undefined && stored.get(k) !== null)
-        .forEach((k) => this.settings.set(k, stored.get(k)));
+        .filter(
+          (k) => settings.get(k) !== undefined && settings.get(k) !== null,
+        )
+        .forEach((k) => this.settings.set(k, settings.get(k)));
     }
     // Upgrade if schema is out of date
-    const oldversion = stored.has('schemaversion')
-      ? parseInt(stored.get('schemaversion'), 10)
+    const oldversion = settings.has('schemaversion')
+      ? parseInt(settings.get('schemaversion'), 10)
       : -1;
     const newversion = settingsdefault.get('schemaversion');
     if (oldversion !== -1 && newversion > oldversion) {
@@ -306,7 +312,7 @@ class Chat {
     })();
 
     // Tooltips
-    tippy.setDefaultProps({ delay: [500, 0] });
+    tippy.setDefaultProps({ delay: 0 });
     tippy('[data-tippy-content]', {
       arrow: roundArrow,
       duration: 0,
@@ -420,7 +426,9 @@ class Chat {
     this.ui.on('click touch', '#chat-watching-focus-btn', () => {
       this.watchingfocus = !this.watchingfocus;
       this.ui.toggleClass('watching-focus', this.watchingfocus);
-      this.ui.find('#chat-watching-focus-btn').toggleClass('active');
+      this.ui
+        .find('#chat-watching-focus-btn > .btn-icon')
+        .toggleClass('active');
     });
 
     // Chat focus / menu close when clicking on some areas
@@ -438,6 +446,67 @@ class Chat {
     this.ui.on('click', '#chat-tools-wrap', () => {
       ChatMenu.closeMenus(this);
       this.focusIfNothingSelected();
+    });
+
+    // Youtube oEmbed tooltip
+    this.ui.on('mouseover', 'a.externallink', async (e) => {
+      const { target } = e;
+
+      // Is on mobile
+      if (!this.isDesktop) {
+        return;
+      }
+
+      // Already processed
+      if (target.dataset.tipped) {
+        return;
+      }
+
+      const match = target.href.match(youtubeidregex);
+
+      // Not a youtube id
+      if (!match) {
+        return;
+      }
+
+      try {
+        const result = await this.youtubeOEmbedService.getOEmbed(match[1]);
+
+        const container = document.createElement('div');
+        container.style.display = 'flex';
+        container.style.flexDirection = 'column';
+        container.style.marginTop = '4px';
+        container.style.gap = '0.25em';
+
+        const img = document.createElement('img');
+        img.src = result.thumbnail_url;
+
+        const title = document.createElement('strong');
+        title.textContent = result.title;
+
+        const author = document.createElement('span');
+        author.textContent = result.author_name;
+
+        container.append(img, title, author);
+
+        const youtubeTippy = tippy(target, {
+          content: container,
+          allowHTML: true,
+          arrow: roundArrow,
+          duration: 0,
+          theme: 'dgg',
+          maxWidth: 250,
+        });
+
+        target.dataset.tipped = true;
+
+        // If still hovering show immediately.
+        if (target.matches(':hover')) {
+          youtubeTippy.show();
+        }
+      } catch (error) {
+        /* Do nothing */
+      }
     });
 
     // ESC
@@ -497,7 +566,7 @@ class Chat {
     this.windowselect.on('click', '.tab-close', (e) => {
       ChatMenu.closeMenus(this);
       this.removeWindow($(e.currentTarget).parent().data('name').toLowerCase());
-      if (this.shouldFocus) {
+      if (this.isDesktop) {
         this.input.focus();
       }
       return false;
@@ -506,7 +575,7 @@ class Chat {
       ChatMenu.closeMenus(this);
       this.windowToFront($(e.currentTarget).data('name').toLowerCase());
       this.menus.get('whisper-users').redraw();
-      if (this.shouldFocus) {
+      if (this.isDesktop) {
         this.input.focus();
       }
       return false;
@@ -571,14 +640,15 @@ class Chat {
       .then((res) => res.json())
       .then((data) => {
         // Set user settings.
-        this.setSettings(new Map(data));
+        const settings = new Map(data);
+        if (!settings.get('profilesettings')) {
+          return;
+        }
+        this.setSettings(settings);
+        this.cacheSettings();
         this.getActiveWindow().update(true);
       })
-      .catch(() => {
-        // Set default settings.
-        this.setSettings();
-        this.getActiveWindow().update(true);
-      });
+      .catch();
   }
 
   async loadEmotesAndFlairs() {
@@ -596,6 +666,7 @@ class Chat {
       .then((res) => res.json())
       .then((json) => {
         this.setEmotes(json);
+        this.refreshEmoteAutocomplete();
       })
       .catch(() => {});
   }
@@ -644,11 +715,14 @@ class Chat {
 
   setEmotes(emotes) {
     this.emoteService.setEmotes(emotes);
+    return this;
+  }
+
+  refreshEmoteAutocomplete() {
     this.emoteService
       .emotesForUser(this.user)
       .map((e) => e.prefix)
       .forEach((e) => this.autocomplete.add(e, true));
-    return this;
   }
 
   setFlairs(flairs) {
@@ -659,20 +733,21 @@ class Chat {
   }
 
   saveSettings() {
-    if (this.authenticated) {
-      if (this.settings.get('profilesettings')) {
-        fetch(`${this.config.api.base}/api/chat/me/settings`, {
-          body: JSON.stringify([...this.settings]),
-          credentials: 'include',
-          method: 'POST',
-          headers: { 'X-CSRF-Guard': 'YEE' },
-        }).catch();
-      } else {
-        ChatStore.write('chat.settings', this.settings);
-      }
-    } else {
-      ChatStore.write('chat.settings', this.settings);
+    this.cacheSettings();
+    if (this.authenticated && this.settings.get('profilesettings')) {
+      fetch(`${this.config.api.base}/api/chat/me/settings`, {
+        body: JSON.stringify([...this.settings]),
+        credentials: 'include',
+        method: 'POST',
+        headers: { 'X-CSRF-Guard': 'YEE' },
+      }).catch();
     }
+  }
+
+  cacheSettings() {
+    const cached = new Map(this.settings);
+    cached.set('profilesettings', false);
+    ChatStore.write('chat.settings', cached);
   }
 
   // De-bounced saveSettings
@@ -738,6 +813,8 @@ class Chat {
       window.updateMessages(this);
     }
 
+    this.mentions.resimulateMessages(this.mainwindow.messages);
+
     return Promise.resolve(this);
   }
 
@@ -756,6 +833,12 @@ class Chat {
         !this.isArraysEqual(data.features, user.features)
       ) {
         user.features = data.features;
+      }
+      if (
+        Object.hasOwn(data, 'roles') &&
+        !this.isArraysEqual(data.roles, user.roles)
+      ) {
+        user.roles = data.roles;
       }
       if (
         Object.hasOwn(data, 'createdDate') &&
@@ -777,6 +860,10 @@ class Chat {
     if (win === null) {
       // eslint-disable-next-line no-param-reassign
       win = this.mainwindow;
+    }
+
+    if (win.containsMessage(message)) {
+      return;
     }
 
     // Break the current combo if this message is not an emote
@@ -840,6 +927,9 @@ class Chat {
     ) {
       message.ignore();
     }
+
+    // Track mentions for autocomplete
+    this.mentions.processMessage(message);
 
     // Show desktop notification
     if (
@@ -972,6 +1062,9 @@ class Chat {
   }
 
   ignored(username, text = null) {
+    if (username === this.user.username) {
+      return false;
+    }
     const ignore = this.ignoring.has(username);
     if (!ignore && text !== null) {
       return (
@@ -1017,7 +1110,7 @@ class Chat {
   }
 
   focusIfNothingSelected() {
-    if (!this.shouldFocus) {
+    if (!this.isDesktop) {
       return;
     }
 
@@ -1110,13 +1203,13 @@ class Chat {
   onME(data) {
     this.setUser(data);
     this.setPreLoginText();
-    if (data) {
+    // Load locally cached settings
+    this.loadCachedSettings();
+    if (this.authenticated) {
       // If is a logged in user.
       this.loadSettings();
       this.loadWhispers();
-    } else {
-      // If guest load default settings.
-      this.setSettings();
+      this.refreshEmoteAutocomplete();
     }
   }
 
@@ -1176,7 +1269,7 @@ class Chat {
   }
 
   onMSG(data) {
-    const textonly = this.removeSlashCmdFromText(data.data);
+    const textonly = removeSlashCommand(data.data);
     const usr = this.users.get(data.nick.toLowerCase());
     const win = this.mainwindow;
 
@@ -1187,7 +1280,7 @@ class Chat {
 
     const isCombo =
       this.emoteService.canUserUseEmote(usr, textonly) &&
-      this.removeSlashCmdFromText(win.lastmessage?.message) === textonly;
+      removeSlashCommand(win.lastmessage?.message) === textonly;
 
     if (isCombo && win.lastmessage?.type === MessageTypes.EMOTE) {
       win.lastmessage.add(message);
@@ -1228,11 +1321,11 @@ class Chat {
   }
 
   onVOTECAST(data) {
-    const usr = this.users.get(data.nick.toLowerCase());
-    this.chatpoll.castVote(data, usr);
-    if (data.nick.toLowerCase() === this.user.username) {
-      this.chatpoll.markVote(data.vote);
-    }
+    this.chatpoll.castVote(data);
+  }
+
+  onVOTECOUNTED(data) {
+    this.chatpoll.markVote(data.vote);
   }
 
   onMUTE(data) {
@@ -1553,30 +1646,26 @@ class Chat {
   cmdSEND(raw) {
     if (raw !== '') {
       const win = this.getActiveWindow();
-      const matches = raw.match(regexslashcmd);
-      const iscommand = matches && matches.length > 1;
-      const ismecmd = iscommand && matches[1].toLowerCase() === 'me';
-      const textonly = this.removeSlashCmdFromText(raw);
+      const slashCommand = getSlashCommand(raw);
+      const isMeCommand = slashCommand === 'ME';
+      const textOnly = removeSlashCommand(raw);
 
       // COMMAND
-      if (iscommand && !ismecmd) {
-        const command = matches[1].toUpperCase();
-        const normalized = command.toUpperCase();
-
+      if (slashCommand && !isMeCommand) {
         // Clear the input and add to history, before we do the emit
         // This makes it possible for commands to change the input.value, else it would be cleared after the command is run.
         this.inputhistory.add(raw);
         this.input.val('');
 
-        if (win !== this.mainwindow && normalized !== 'EXIT') {
+        if (win !== this.mainwindow && slashCommand !== 'EXIT') {
           MessageBuilder.error(
             `No commands in private windows. Try /exit`,
           ).into(this, win);
-        } else if (this.control.listeners.has(normalized)) {
-          const parts = (raw.substring(command.length + 1) || '').match(
-            /([^ ]+)/g,
-          );
-          this.control.emit(normalized, parts || []);
+        } else if (this.control.listeners.has(slashCommand)) {
+          const argsString = raw.substring(slashCommand.length + 1) || '';
+          const parts = argsString.match(/([^ ]+)/g);
+          const parsedArgs = yargsParser(argsString);
+          this.control.emit(slashCommand, parts || [], parsedArgs);
         } else {
           MessageBuilder.error(`Unknown command. Try /help`).into(this, win);
         }
@@ -1595,7 +1684,7 @@ class Chat {
       // VOTE
       else if (
         this.chatpoll.isPollStarted() &&
-        this.chatpoll.isMsgVoteCastFmt(textonly)
+        this.chatpoll.isMsgVoteCastFmt(textOnly)
       ) {
         if (this.chatpoll.poll.canVote) {
           MessageBuilder.info(`Your vote has been cast!`).into(this);
@@ -1609,7 +1698,7 @@ class Chat {
       // EMOTE SPAM
       else if (
         this.source.isConnected() &&
-        this.emoteService.getEmote(textonly)
+        this.emoteService.getEmote(textOnly)
       ) {
         // Its easier to deal with combos with the this.unresolved flow
         this.source.send('MSG', { data: raw });
@@ -2406,9 +2495,9 @@ class Chat {
       });
   }
 
-  cmdHOST(parts) {
-    let url = parts[0];
-    const displayName = parts.slice(1).join(' ') || undefined;
+  cmdHOST(_, args) {
+    let url = _[0];
+    const { displayName, title } = args;
 
     if (
       !this.user.hasAnyRoles(
@@ -2423,7 +2512,7 @@ class Chat {
 
     if (!url) {
       MessageBuilder.error(
-        'No argument provided - /host <url> <displayName optional>',
+        'No argument provided - /host [--display-name <display-name>] [--title <title>] <url>',
       ).into(this);
       return;
     }
@@ -2438,13 +2527,13 @@ class Chat {
       new URL(url); // eslint-disable-line no-new
     } catch (e) {
       MessageBuilder.error(
-        'Invalid url - /host <url> <displayName optional>',
+        'Invalid url - /host [--display-name <display-name>] [--title <title>] <url>',
       ).into(this);
       return;
     }
 
     fetch(`${this.config.api.base}/api/stream/host`, {
-      body: JSON.stringify({ url, displayName }),
+      body: JSON.stringify({ url, displayName, title }),
       credentials: 'include',
       method: 'POST',
       headers: { 'X-CSRF-Guard': 'YEE' },
@@ -2540,7 +2629,7 @@ class Chat {
       }
       this.windowToFront(normalized);
       this.menus.get('whisper-users').redraw();
-      if (this.shouldFocus) {
+      if (this.isDesktop) {
         this.input.focus();
       }
     }
@@ -2613,21 +2702,33 @@ class Chat {
    * @param {ChatUserMessage} message
    */
   shouldHighlightMessage(message) {
-    return (
-      /* this.authenticated && */ !message.isown &&
-      // Check current user nick against msg.message (if highlight setting is on)
-      ((this.regexhighlightself &&
-        this.settings.get('highlight') &&
-        this.regexhighlightself.test(message.message.replace(linkregex, ''))) ||
-        // Check /highlight nicks against msg.nick
-        (this.regexhighlightnicks &&
-          this.regexhighlightnicks.test(message.user.username)) ||
-        // Check custom highlight against msg.nick and msg.message
-        (this.regexhighlightcustom &&
-          this.regexhighlightcustom.test(
-            `${message.user.username} ${message.message}`,
-          )))
-    );
+    if (message.isown) {
+      return false;
+    }
+
+    let selfMentioned = false;
+    let someoneElseMentioned = false;
+    let customHighlightMentioned = false;
+
+    if (this.regexhighlightself && this.settings.get('highlight')) {
+      selfMentioned = this.regexhighlightself.test(
+        this.removeLinksFromText(message.message),
+      );
+    }
+
+    if (this.regexhighlightnicks) {
+      someoneElseMentioned = this.regexhighlightnicks.test(
+        message.user.username,
+      );
+    }
+
+    if (this.regexhighlightcustom) {
+      customHighlightMentioned = this.regexhighlightcustom.test(
+        `${message.user.username} ${message.message}`,
+      );
+    }
+
+    return selfMentioned || someoneElseMentioned || customHighlightMentioned;
   }
 
   isBigscreenEmbed() {
@@ -2642,15 +2743,23 @@ class Chat {
     return '/bigscreen';
   }
 
-  removeSlashCmdFromText(msg) {
-    return msg?.replace(regexslashcmd, '').trim();
-  }
-
   extractNicks(text) {
     const uniqueNicks = new Set(
-      text.replace(linkregex, '').match(nickmessageregex),
+      this.removeLinksFromText(text).match(nickmessageregex),
     );
     return [...uniqueNicks];
+  }
+
+  removeLinksFromText(text) {
+    const links = linkify.find(text);
+    if (links.length === 0) {
+      return text;
+    }
+
+    return links.reduceRight(
+      (acc, cur) => acc.slice(0, cur.start) + acc.slice(cur.end),
+      text,
+    );
   }
 
   removeClasses(search, classList) {

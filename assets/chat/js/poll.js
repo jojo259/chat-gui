@@ -1,6 +1,7 @@
 import $ from 'jquery';
 import { throttle } from 'throttle-debounce';
 import UserFeatures from './features';
+import UserRoles from './roles';
 import { MessageBuilder } from './messages';
 
 const POLL_CONJUNCTION = /\bor\b/i;
@@ -106,10 +107,12 @@ class ChatPoll {
   }
 
   hasPermission(user) {
-    return user.hasAnyFeatures(
-      UserFeatures.ADMIN,
-      UserFeatures.BOT,
-      UserFeatures.MODERATOR,
+    return (
+      user.hasAnyFeatures(
+        UserFeatures.ADMIN,
+        UserFeatures.BOT,
+        UserFeatures.MODERATOR,
+      ) || user.hasRole(UserRoles.POLLS)
     );
   }
 
@@ -121,37 +124,10 @@ class ChatPoll {
     return false;
   }
 
-  castVote(data, user) {
-    const votes = this.votesForUser(user);
-    this.poll.totals[data.vote - 1] += votes;
-    this.poll.votesCast += votes;
+  castVote(data) {
+    this.poll.totals[data.vote - 1] += data.quantity;
+    this.poll.votesCast += data.quantity;
     this.throttleVoteCast(data.vote);
-  }
-
-  votesForUser(user) {
-    switch (this.poll.type) {
-      case PollType.Weighted:
-        if (user.hasFeature(UserFeatures.SUB_TIER_5)) {
-          return 32;
-        }
-        if (user.hasFeature(UserFeatures.SUB_TIER_4)) {
-          return 16;
-        }
-        if (user.hasFeature(UserFeatures.SUB_TIER_3)) {
-          return 8;
-        }
-        if (user.hasFeature(UserFeatures.SUB_TIER_2)) {
-          return 4;
-        }
-        if (user.hasFeature(UserFeatures.SUB_TIER_1)) {
-          return 2;
-        }
-
-        return 1;
-      case PollType.Normal:
-      default:
-        return 1;
-    }
   }
 
   startPoll(data) {

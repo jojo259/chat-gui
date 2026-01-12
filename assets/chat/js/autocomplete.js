@@ -127,6 +127,16 @@ function selectHelper(ac) {
   }
 }
 
+function shouldOpenHighlightedBy(ac) {
+  const str = ac.input.val().toString();
+  const prevChar = str[ac.input[0].selectionStart - 1];
+  return (
+    str.length === 0 ||
+    /\s/.test(prevChar) ||
+    (str.length === 1 && prevChar === '>')
+  );
+}
+
 class ChatAutoComplete {
   constructor() {
     /** @member jQuery */
@@ -160,6 +170,22 @@ class ChatAutoComplete {
           this.select(
             this.selected >= this.results.length - 1 ? 0 : this.selected + 1,
           );
+        } else if (
+          chat.mentions.data.length > 0 &&
+          shouldOpenHighlightedBy(this)
+        ) {
+          const str = this.input.val().toString();
+          const offset = this.input[0].selectionStart;
+          this.criteria = buildSearchCriteria(str, offset);
+          this.selected = -1;
+          this.results = chat.mentions.data.map((mention) => ({
+            data: mention.user,
+            isemote: false,
+            weight: mention.timestamp.valueOf(),
+          }));
+          this.buildHelpers();
+          updateHelpers(this);
+          timeoutHelpers(this);
         }
         e.preventDefault();
         e.stopPropagation();

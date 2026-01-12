@@ -24,9 +24,11 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
     this.flairList = this.ui.find('.user-info .flairs');
     this.flairSubheader = this.ui.find('.user-info h5.flairs-subheader')[0];
 
-    this.messagesList = this.ui.find('.user-info .stalk');
-    this.messagesContainer = this.ui.find('.content');
-    this.messagesSubheader = this.ui.find('.user-info h5.stalk-subheader')[0];
+    this.messagesContainer = this.ui.find('.content .messages');
+    this.messageHistoryStatus = this.ui.find(
+      '.content .message-history-status',
+    );
+    this.noMessageNotice = this.ui.find('.content .no-messages-notice');
 
     this.muteUserBtn = this.ui.find('#mute-user-btn');
     this.banUserBtn = this.ui.find('#ban-user-btn');
@@ -60,6 +62,8 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
     this.chat.output.on('mouseup', '.msg-chat .user', (e) => {
       e.stopPropagation();
     });
+
+    this.chat.source.on('MSG', this.handleNewMessage.bind(this));
   }
 
   showUser(e, message) {
@@ -253,7 +257,10 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
     const watchingEmbed = this.buildWatchingEmbed(this.clickedNick);
     if (watchingEmbed !== '') {
       this.watchingSubheader.style.display = '';
-      this.watchingSubheader.replaceChildren('Watching: ', watchingEmbed);
+      this.watchingSubheader.replaceChildren(
+        'Watching: ',
+        $(watchingEmbed).get()[0],
+      );
     } else {
       this.watchingSubheader.style.display = 'none';
       this.watchingSubheader.replaceChildren();
@@ -287,31 +294,39 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
       this.flairSubheader.style.display = 'none';
     }
 
-    const messageList = this.createMessages(displayName);
-    if (messageList.length === 0) {
-      this.messagesList.toggleClass('hidden', true);
-      this.messagesSubheader.style.display = 'none';
-    } else {
-      this.messagesList.toggleClass('hidden', false);
-      this.messagesSubheader.innerText = `Selected message${
-        messageList.length === 1 ? '' : 's'
-      }:`;
-      this.messagesSubheader.style.display = '';
-    }
-
     this.header.text('');
     this.header.attr('class', 'username');
     this.messagesContainer.empty();
+    this.updateNoMessagesNotice(true);
     this.flairList.empty();
 
     this.header.text(displayName);
     this.header.addClass(usernameFeatures);
     this.flairList.append(featuresList);
-    messageList.forEach((element) => {
-      this.messagesContainer.append(element);
-    });
 
-    this.redraw();
+    this.setMessageHistoryStatus('Loading history...');
+    this.loadMessageHistory(displayName)
+      .then((messages) => {
+        messages.forEach((m) => {
+          const messageElement = this.buildMessageMarkup({
+            username: displayName,
+            messageText: m.messageText,
+            timestamp: m.timestamp,
+          });
+          this.messagesContainer.prepend(messageElement);
+        });
+        this.updateNoMessagesNotice();
+        this.setMessageHistoryStatus(null);
+      })
+      .catch((error) => {
+        this.setMessageHistoryStatus(
+          `Failed to load history: ${error.message}`,
+        );
+      })
+      .finally(() => {
+        this.redraw();
+        this.scrollplugin.scrollBottom();
+      });
   }
 
   buildWatchingEmbed(nick) {
@@ -319,7 +334,10 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
     if (!user?.watching) {
       return '';
     }
-    return `${user.watching.id} on ${user.watching.platform}`;
+    const target = this.chat.isBigscreenEmbed() ? '_top' : '_blank';
+    const baseUrl = this.chat.config.dggOrigin + this.chat.bigscreenPath;
+    const url = `${baseUrl}#${user.watching.platform}/${user.watching.id}`;
+    return `<a href="${url}" target="${target}">${user.watching.id} on ${user.watching.platform}</a>`;
   }
 
   buildCreatedDate(nick) {
@@ -350,31 +368,8 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
     return features !== '' ? `<span class="features">${features}</span>` : '';
   }
 
-  createMessages(nick) {
-    const displayedMessages = [];
-    if (this.messageArray.length > 0) {
-      let nextMsg = this.messageArray[0].next('.msg-continue');
-      while (nextMsg.length > 0) {
-        this.messageArray.push(nextMsg);
-        nextMsg = nextMsg.next('.msg-continue');
-      }
-      this.messageArray.forEach((element) => {
-        const textContainer = element.find('.text')[0];
-        let rawText = '';
-        for (const node of textContainer.childNodes) {
-          if (node instanceof HTMLAnchorElement) {
-            rawText += node.href;
-          } else {
-            rawText += node.textContent;
-          }
-        }
-
-        // Create a new `ChatUser` to remove username styles for a cleaner look.
-        const msg = MessageBuilder.message(rawText, new ChatUser(nick));
-        displayedMessages.push(msg.html(this.chat));
-      });
-    }
-    return displayedMessages;
+  async loadMessageHistory(username) {
+    return this.chat.userMessageService.getUserMessages(username);
   }
 
   buildFeatureHTML(featureArray) {
@@ -387,5 +382,53 @@ export default class ChatUserInfoMenu extends ChatMenuFloating {
         }
         return `${str}<div class="flair" title="${e.label}">${e.label}</div> `;
       }, '');
+  }
+
+  buildMessageMarkup(message) {
+    // Create a new `ChatUser` to remove username styles
+    const user = new ChatUser(message.username);
+    const messageObject = MessageBuilder.message(
+      message.messageText,
+      user,
+      message.timestamp,
+    );
+
+    return messageObject.html(this.chat);
+  }
+
+  handleNewMessage(message) {
+    if (!this.visible) {
+      return;
+    }
+
+    if (message.nick?.toLowerCase() === this.clickedNick) {
+      const messageElement = this.buildMessageMarkup({
+        username: message.nick,
+        messageText: message.data,
+        timestamp: message.timestamp,
+      });
+
+      const wasPinned = this.scrollplugin.pinned;
+
+      this.messagesContainer.append(messageElement);
+      this.updateNoMessagesNotice();
+
+      if (wasPinned) {
+        this.scrollplugin.scrollBottom();
+      }
+    }
+  }
+
+  setMessageHistoryStatus(message) {
+    this.messageHistoryStatus.text(message);
+    this.messageHistoryStatus.toggleClass('hidden', !message);
+  }
+
+  updateNoMessagesNotice(forceHide = false) {
+    this.noMessageNotice.toggleClass('hidden', this.hasMessages() || forceHide);
+  }
+
+  hasMessages() {
+    return this.messagesContainer.children().length > 0;
   }
 }

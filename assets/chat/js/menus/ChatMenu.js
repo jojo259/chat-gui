@@ -14,7 +14,7 @@ export default class ChatMenu extends EventEmitter {
     });
     this.ui.on('click', '.close,.chat-menu-close', this.hide.bind(this));
     this.btn.on('click', (e) => {
-      if (this.visible && this.chat.shouldFocus) {
+      if (this.visible && this.chat.isDesktop) {
         chat.input.focus();
       }
       this.toggle(e);
@@ -26,7 +26,7 @@ export default class ChatMenu extends EventEmitter {
     if (!this.visible) {
       this.visible = true;
       this.shown = true;
-      this.btn.addClass('active');
+      this.btn.find('.btn-icon').addClass('active');
       this.ui.addClass('active');
       this.redraw();
       this.emit('show');
@@ -36,7 +36,7 @@ export default class ChatMenu extends EventEmitter {
   hide() {
     if (this.visible) {
       this.visible = false;
-      this.btn.removeClass('active');
+      this.btn.find('.btn-icon').removeClass('active');
       this.ui.removeClass('active');
       this.emit('hide');
     }
